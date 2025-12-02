@@ -1,0 +1,694 @@
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <String.h>
+#include <OneButton.h>
+
+// Oled Definitions
+#define SCREEN_WIDTH 128     // OLED display width, in pixels
+#define SCREEN_HEIGHT 32     // OLED display height, in pixels
+#define SCREEN_ADDRESS 0x3C  // See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+#define OLED_RESET -1        // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_BUTTON_PIN 21 // Button pin
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Button Definitions
+OneButton button(SCREEN_BUTTON_PIN, true); // Button object
+
+int actionPage = 0;
+int pageOption = 0;
+
+int maxGraphValue = 0; // Maximum value for the graph
+unsigned long lastUpdate = 0;
+
+// Servos Definitions
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+#define SERVOMIN 100  // Minimum pulse length count
+#define SERVOMAX 600  // Maximum pulse length count
+#define SERVO_FREQ 60 // Servo frequency (60 Hz)
+
+// Hall Sensor Definitions
+// #define HALL_SENSOR_PIN_THUMB 33  // Hall sensor pin
+#define HALL_SENSOR_PIN_THUMB A1  // Hall sensor pin
+#define HALL_SENSOR_PIN_INDEX A2  // Hall sensor pin 2
+#define HALL_SENSOR_PIN_MIDDLE A3 // Hall sensor pin 3
+#define HALL_SENSOR_PIN_RING A4   // Hall sensor pin 4
+#define HALL_SENSOR_PIN_LITTLE A4 // Hall sensor pin 5
+
+const int numReadings = 10;
+int readings[numReadings];
+int readIndex = 0;
+long total = 0;
+int aisVal = 0;
+
+// Feedback Pins
+#define FEED_1_BACK_INDEX 13 // Feedback pin
+#define FEED_2_BACK_INDEX 14 // Feedback pin
+#define FEED_3_BACK_INDEX 15 // Feedback pin
+
+#define STOP_FEEDBACK 82
+#define MED_FEEDBACK 85
+#define MAX_FEEDBACK 90
+
+int HALL_SENSOR_PIN_THUMB_THRESHOLD = 2360;
+int HALL_SENSOR_PIN_INDEX_THRESHOLD = 2350;
+int HALL_SENSOR_PIN_MIDDLE_THRESHOLD = 2270;
+int HALL_SENSOR_PIN_RING_THRESHOLD = 2620;
+int HALL_SENSOR_PIN_LITTLE_THRESHOLD = 2630;
+int ANALOG_EMG_1_PIN_THRESHOLD = 1300;
+
+// EMG Sensor Definitions
+#define ANALOG_EMG_1_PIN A0 // EMG 1 Pin
+
+unsigned long lastEmgToggleTime = 0;
+unsigned long emgMillis = millis();
+const int limiteInferior = 2100;
+const int limiteSuperior = 2500;
+const int intervaloLeitura = 5; // ms
+const int duracaoMinima = 10;   // ms
+const int tempoEspera = 1000;   // 1 segundo entre contagens
+const int leiturasNecessarias = duracaoMinima / intervaloLeitura;
+int contadorDentroDaFaixa = 0;
+bool contracaoDetectada = false;
+unsigned long tempoUltimaContracao = 0;
+int totalContracoes = 0;
+bool lockReading = false;
+unsigned long lastToggleMillis = 0;
+bool handState = false; // Hand state
+
+void printDisplayLine(int line, String text)
+{
+  display.setCursor(0, line * 10); // Set cursor position
+  display.print(text);             // Print text
+  // display.display();               // Display the text
+}
+
+void clearDisplayLine(int line)
+{
+  display.setCursor(0, line * 10); // Set cursor position
+  display.fillRect(0, line * 10, SCREEN_WIDTH, 10, SSD1306_BLACK);
+}
+
+void clearHalfDisplayLine(int line, int half)
+{
+  if (half == 0)
+  {
+    display.fillRect(0, line * 10, SCREEN_WIDTH / 2, 10, SSD1306_BLACK);
+  }
+  else
+  {
+    display.fillRect(SCREEN_WIDTH / 2, line * 10, SCREEN_WIDTH / 2, 10, SSD1306_BLACK);
+  }
+}
+
+void drawLineGraph(int value)
+{
+
+  if (value > maxGraphValue)
+  {
+    maxGraphValue = value; // Update the maximum value
+  }
+
+  // printDisplayLine(0, "Max V-> " + String(maxGraphValue));
+
+  static int graph[SCREEN_WIDTH] = {0}; // Array to store graph values
+  static int xPos = 0;                  // Current position in the graph
+
+  int mappedValue = map(value, 0, 100, SCREEN_HEIGHT - 1, 0);
+  graph[xPos] = mappedValue;
+  display.fillRect(0, 20, SCREEN_WIDTH, 10, SSD1306_BLACK);
+
+  for (int i = 0; i < SCREEN_WIDTH - 1; i++)
+  {
+    display.drawLine(i, graph[i], i + 1, graph[i + 1], SSD1306_WHITE);
+  }
+  xPos = (xPos + 1) % SCREEN_WIDTH;
+}
+
+void progressBar(int value)
+{
+  display.fillRect(0, 24, map(value, 100, 0, 0, SCREEN_WIDTH), 8, SSD1306_WHITE);
+}
+
+// Hand Functions
+
+void toggleHandStateOpen()
+{
+  handState = true;
+  Serial.printf("Hand state: %s", handState ? "Open" : "Close");
+  Serial.println();
+}
+
+void toggleHandStateClose()
+{
+  handState = false;
+  Serial.printf("Hand state: %s", handState ? "Open" : "Close");
+  Serial.println();
+}
+
+void movServoByAngle(int servo, int angle)
+{
+  int pulseLength = map(angle, 0, 180, SERVOMIN, SERVOMAX);
+  pwm.setPWM(servo, 0, pulseLength);
+}
+
+void activeFeedBack(int value, int threshold)
+{
+  if (value > threshold)
+  {
+    movServoByAngle(FEED_1_BACK_INDEX, MED_FEEDBACK);
+    movServoByAngle(FEED_2_BACK_INDEX, MED_FEEDBACK);
+    movServoByAngle(FEED_3_BACK_INDEX, MED_FEEDBACK);
+  }
+  else
+  {
+
+    movServoByAngle(FEED_1_BACK_INDEX, STOP_FEEDBACK);
+    movServoByAngle(FEED_2_BACK_INDEX, STOP_FEEDBACK);
+    movServoByAngle(FEED_3_BACK_INDEX, STOP_FEEDBACK);
+  }
+}
+
+void openHand()
+{
+
+  Serial.println("Opening hand");
+  pwm.setPWM(0, 0, SERVOMIN);
+  pwm.setPWM(1, 0, SERVOMIN);
+  pwm.setPWM(2, 0, SERVOMIN);
+  pwm.setPWM(3, 0, SERVOMIN);
+  pwm.setPWM(4, 0, SERVOMIN);
+}
+
+void closeHand()
+{
+
+  Serial.println("Closing hand");
+  pwm.setPWM(0, 0, SERVOMAX);
+  pwm.setPWM(1, 0, SERVOMAX);
+  pwm.setPWM(2, 0, SERVOMAX);
+  pwm.setPWM(3, 0, SERVOMAX);
+  pwm.setPWM(4, 0, SERVOMAX);
+}
+
+void openFinger(int finger)
+{
+  Serial.printf("Opening finger %d", finger);
+  Serial.println();
+  pwm.setPWM(finger, 0, SERVOMIN);
+}
+
+void closeFinger(int finger)
+{
+  Serial.printf("Closing finger %d", finger);
+  Serial.println();
+  pwm.setPWM(finger, 0, SERVOMAX);
+}
+
+void openFingers(int *fingers)
+{
+  Serial.println("Opening fingers");
+  for (int i = 0; i < sizeof(fingers) / sizeof(fingers[0]); i++)
+  {
+    pwm.setPWM(fingers[i], 0, SERVOMIN);
+  }
+}
+
+void closeFingers(int *fingers)
+{
+  Serial.println("Closing fingers");
+  for (int i = 0; i < sizeof(fingers) / sizeof(fingers[0]); i++)
+  {
+    pwm.setPWM(fingers[i], 0, SERVOMAX);
+  }
+}
+
+void checkHandState(bool enableServo)
+{
+  if (handState)
+  {
+    if (enableServo)
+    {
+      openHand();
+    }
+    printDisplayLine(1, "Open Hand");
+    display.display();
+  }
+  else
+  {
+    if (enableServo)
+    {
+      closeHand();
+    }
+    printDisplayLine(1, "Close Hand");
+    display.display();
+  }
+}
+
+void toggleHandState(bool enableServo)
+{
+  handState = !handState;
+  Serial.printf("Hand state: %s", handState ? "Open" : "Close");
+  checkHandState(enableServo);
+  Serial.println();
+}
+
+// Hall Sensor Functions
+int readAnalogHall(int pin)
+{
+  int hallSensorValue = analogRead(pin);
+  Serial.printf("Hall Sensor => %d", hallSensorValue);
+  Serial.println();
+  return hallSensorValue;
+}
+
+bool checkPress(int pin, int threshold)
+{
+  int hallSensorValue = analogRead(pin);
+  Serial.printf("Hall Sensor => %d", hallSensorValue);
+  Serial.println();
+  if (hallSensorValue < threshold)
+  {
+    Serial.println("Pressed");
+    return true;
+  }
+  else
+  {
+    Serial.println("Not Pressed");
+    return false;
+  }
+}
+
+long smooth(int vPin, int threshold)
+{ /* function smooth */
+  ////Perform average on sensor readings
+  long average;
+  // subtract the last reading:
+  total = total - readings[readIndex];
+
+  int reading = analogRead(vPin);
+  // read the sensor:
+  // readings[readIndex] = threshold - analogRead(vPin);
+  readings[readIndex] = threshold - reading;
+
+  // add value to total:
+  total = total + readings[readIndex];
+  // handle index
+  readIndex = readIndex + 1;
+  if (readIndex >= numReadings)
+  {
+    readIndex = 0;
+  }
+  // calculate the average:
+  average = total / numReadings;
+
+  if (average < 0)
+  {
+    return 0;
+  }
+  else
+  {
+    return average;
+  }
+  return 0; // Default return value to ensure all paths return a value
+}
+
+void displayHallSensorGraph()
+{
+  if (checkPress(HALL_SENSOR_PIN_THUMB, HALL_SENSOR_PIN_THUMB_THRESHOLD))
+  {
+    printDisplayLine(0, "Thum -> " + String(smooth(HALL_SENSOR_PIN_THUMB, HALL_SENSOR_PIN_THUMB_THRESHOLD)));
+    drawLineGraph(smooth(HALL_SENSOR_PIN_THUMB, HALL_SENSOR_PIN_THUMB_THRESHOLD));
+  }
+  else if (checkPress(HALL_SENSOR_PIN_INDEX, HALL_SENSOR_PIN_INDEX_THRESHOLD))
+  {
+    printDisplayLine(0, "Inde -> " + String(smooth(HALL_SENSOR_PIN_INDEX, HALL_SENSOR_PIN_INDEX_THRESHOLD)));
+    drawLineGraph(smooth(HALL_SENSOR_PIN_INDEX, HALL_SENSOR_PIN_INDEX_THRESHOLD));
+  }
+  else if (checkPress(HALL_SENSOR_PIN_MIDDLE, HALL_SENSOR_PIN_MIDDLE_THRESHOLD))
+  {
+    printDisplayLine(0, "Midd -> " + String(smooth(HALL_SENSOR_PIN_MIDDLE, HALL_SENSOR_PIN_MIDDLE_THRESHOLD)));
+    drawLineGraph(smooth(HALL_SENSOR_PIN_MIDDLE, HALL_SENSOR_PIN_MIDDLE_THRESHOLD));
+  }
+  else if (checkPress(HALL_SENSOR_PIN_RING, HALL_SENSOR_PIN_RING_THRESHOLD))
+  {
+    printDisplayLine(0, "Ring -> " + String(smooth(HALL_SENSOR_PIN_RING, HALL_SENSOR_PIN_RING_THRESHOLD)));
+    drawLineGraph(smooth(HALL_SENSOR_PIN_RING, HALL_SENSOR_PIN_RING_THRESHOLD));
+  }
+  else if (checkPress(HALL_SENSOR_PIN_LITTLE, HALL_SENSOR_PIN_LITTLE_THRESHOLD))
+  {
+    printDisplayLine(0, "Litt -> " + String(smooth(HALL_SENSOR_PIN_LITTLE, HALL_SENSOR_PIN_LITTLE_THRESHOLD)));
+    drawLineGraph(smooth(HALL_SENSOR_PIN_LITTLE, HALL_SENSOR_PIN_LITTLE_THRESHOLD));
+  }
+  else
+  {
+    printDisplayLine(0, "Press a Finger");
+  }
+}
+
+void debugAnalog(int number)
+{
+  long smoothValue = 0; // Declare smoothValue outside the switch
+  switch (number)
+  {
+  case 0:
+    smoothValue = smooth(HALL_SENSOR_PIN_THUMB, HALL_SENSOR_PIN_THUMB_THRESHOLD);
+    printDisplayLine(1, "Thum -> " + String(smoothValue));
+    drawLineGraph(smoothValue);
+    activeFeedBack(smoothValue, 15);
+    break;
+  case 1:
+    smoothValue = smooth(HALL_SENSOR_PIN_INDEX, HALL_SENSOR_PIN_INDEX_THRESHOLD);
+    printDisplayLine(1, "Inde -> " + String(smoothValue));
+    drawLineGraph(smoothValue);
+    activeFeedBack(smoothValue, 15);
+    break;
+  case 2:
+    smoothValue = smooth(HALL_SENSOR_PIN_MIDDLE, HALL_SENSOR_PIN_MIDDLE_THRESHOLD);
+    printDisplayLine(1, "Midd -> " + String(smoothValue));
+    drawLineGraph(smoothValue);
+    activeFeedBack(smoothValue, 15);
+    break;
+  case 3:
+    smoothValue = smooth(HALL_SENSOR_PIN_RING, HALL_SENSOR_PIN_RING_THRESHOLD);
+    printDisplayLine(1, "Ring -> " + String(smoothValue));
+    drawLineGraph(smoothValue);
+    activeFeedBack(smoothValue, 15);
+    break;
+  case 4:
+    smoothValue = smooth(HALL_SENSOR_PIN_LITTLE, HALL_SENSOR_PIN_LITTLE_THRESHOLD);
+    printDisplayLine(1, "Litt -> " + String(smoothValue));
+    drawLineGraph(smoothValue);
+    activeFeedBack(smoothValue, 15);
+    break;
+  default:
+    printDisplayLine(1, "Press a Finger");
+    break;
+  }
+}
+
+// Init Functions
+void initDisplay()
+{
+  Serial.println("Initializing OLED");
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS); // Initialize OLED display
+  display.clearDisplay();                              // Clear the display
+  display.setTextSize(1);                              // Set text size
+  display.setTextColor(SSD1306_WHITE);
+}
+
+void initHand()
+{
+  // display.clearDisplay();                  // Clear the display
+  // printDisplayLine(0, "Closing Hand ..."); // Print message
+  // display.display();                       // Display the text
+  closeHand(); // Open hand
+  delay(2000);
+  // display.clearDisplay();                  // Clear the display
+  // printDisplayLine(0, "Opening Hand ..."); // Print message
+  // display.display();                       // Display the text
+  openHand(); // Close hand
+  delay(2000);
+  // display.clearDisplay(); // Clear the display
+}
+
+void initPCA9685()
+{
+  Serial.println("Initializing PCA9685");
+  pwm.begin();                // Initialize PCA9685
+  pwm.setPWMFreq(SERVO_FREQ); // Set frequency to 60 Hz
+  delay(1000);
+  initHand();
+}
+void initHallSensor()
+{
+  pinMode(HALL_SENSOR_PIN_THUMB, INPUT);
+  pinMode(HALL_SENSOR_PIN_INDEX, INPUT);
+  pinMode(HALL_SENSOR_PIN_MIDDLE, INPUT);
+  pinMode(HALL_SENSOR_PIN_RING, INPUT);
+  pinMode(HALL_SENSOR_PIN_LITTLE, INPUT);
+  pinMode(ANALOG_EMG_1_PIN, INPUT);
+}
+void initEMG()
+{
+  pinMode(ANALOG_EMG_1_PIN, INPUT);
+}
+
+// EMG Functions
+
+void unlockReading()
+{
+  if (millis() - lastToggleMillis >= 2000)
+  {
+    lastToggleMillis = millis();
+    lockReading = false; // Reset the lock after 2 seconds
+  }
+}
+
+void emgProcessor(int intervaloLeitura)
+{
+  static unsigned long lastMillis = 0;
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastMillis >= intervaloLeitura)
+  {
+    lastMillis = currentMillis;
+
+    int emgValor = analogRead(ANALOG_EMG_1_PIN);
+
+    // Verifica se o sinal está dentro da faixa
+
+    if (emgValor >= limiteInferior && emgValor <= limiteSuperior)
+    {
+      contadorDentroDaFaixa++;
+
+      // Se ficou por tempo suficiente, conta como contração
+      if (!contracaoDetectada && contadorDentroDaFaixa >= leiturasNecessarias)
+      {
+        lockReading = true;
+        totalContracoes++;
+        Serial.print(">>> CONTRAÇÃO DETECTADA! Total: ");
+        Serial.println(totalContracoes);
+        contracaoDetectada = true;
+        toggleHandState(false);
+      }
+    }
+    else
+    {
+      // Se saiu da faixa, resetar contagem
+      contadorDentroDaFaixa = 0;
+      contracaoDetectada = false;
+    }
+  }
+}
+
+// Button Functions
+void click()
+{
+  Serial.println("Single Click");
+  pageOption++;
+}
+
+void doubleClick()
+{
+  Serial.println("Double Click");
+}
+
+void longPressStart()
+{
+  Serial.println("Long Press Start");
+}
+
+void longPressStop()
+{
+  Serial.println("Long Press Stop");
+  pageOption = 0;
+  actionPage++;
+  if (actionPage > 4)
+  {
+    actionPage = 0;
+  }
+}
+
+void toggleHandPage(int pageOption)
+{
+
+  switch (pageOption)
+  {
+  case 0:
+    printDisplayLine(1, "Open Hand");
+    printDisplayLine(2, "Page Option -> 0");
+    openHand();
+    break;
+  case 1:
+    printDisplayLine(1, "Close Hand");
+    printDisplayLine(2, "Page Option -> 1");
+    closeHand();
+    break;
+  }
+  Serial.print("Page Option -> ");
+  Serial.print(pageOption);
+  Serial.println();
+  display.display();
+}
+
+void toggleGestureHand(int pageOption)
+{
+  switch (pageOption)
+  {
+  case 0:
+    printDisplayLine(1, "Gesture 0");
+    printDisplayLine(2, "Page Option -> 0");
+    // OK
+    closeFinger(0);
+    closeFinger(1);
+    openFinger(2);
+    openFinger(3);
+    openFinger(4);
+    break;
+  case 1:
+    printDisplayLine(1, "Gesture 1");
+    printDisplayLine(2, "Page Option -> 1");
+    closeFinger(0);
+    openFinger(1);
+    closeFinger(2);
+    closeFinger(3);
+    closeFinger(4);
+    break;
+  case 2:
+    printDisplayLine(1, "Gesture 2");
+    printDisplayLine(2, "Page Option -> 2");
+    closeFinger(0);
+    openFinger(1);
+    openFinger(2);
+    closeFinger(3);
+    closeFinger(4);
+    break;
+  case 3:
+    printDisplayLine(1, "Gesture 3");
+    printDisplayLine(2, "Page Option -> 3");
+    closeFinger(0);
+    openFinger(1);
+    openFinger(2);
+    openFinger(3);
+    closeFinger(4);
+    break;
+  case 4:
+    printDisplayLine(1, "Gesture 4");
+    printDisplayLine(2, "Page Option -> 4");
+    openFinger(0);
+    openFinger(1);
+    openFinger(2);
+    openFinger(3);
+    openFinger(4);
+    break;
+  }
+  Serial.print("Page Option -> ");
+  Serial.print(pageOption);
+  Serial.println();
+  display.display();
+}
+
+void getActionPage()
+{
+  switch (actionPage)
+  {
+  case 0:
+    display.clearDisplay(); // Clear the display
+    printDisplayLine(0, "Deb Hall");
+    if (pageOption > 4)
+    {
+      pageOption = 0;
+    }
+    debugAnalog(pageOption);
+    break;
+  case 1:
+    display.clearDisplay(); // Clear the display
+    printDisplayLine(0, "Btn Hand Page");
+    if (pageOption > 1)
+    {
+      pageOption = 0;
+    }
+    toggleHandPage(pageOption);
+    break;
+  case 2:
+    display.clearDisplay(); // Clear the display
+    printDisplayLine(0, "Gesture Hand Page");
+    if (pageOption > 4)
+    {
+      pageOption = 0;
+    }
+    toggleGestureHand(pageOption);
+    break;
+  case 3:
+    display.clearDisplay(); // Clear the display
+    printDisplayLine(0, "Emg Hand Page");
+    if (!lockReading)
+    {
+      emgProcessor(intervaloLeitura);
+    }
+    break;
+  default:
+    break;
+  }
+  display.display(); // Display the text
+}
+
+void setup()
+{
+  Serial.begin(115200); // Initialize serial communication
+  delay(1000);
+  Serial.println("Initializing");
+  analogReadResolution(12);
+  initDisplay();                            // Initialize OLED display
+  printDisplayLine(0, "Initializing OLED"); // Print message
+  display.display();
+  delay(500);
+  display.clearDisplay();
+  printDisplayLine(0, "Button Init"); // Print message
+  display.display();
+  button.attachClick(click);                   // Attach click event
+  button.attachDoubleClick(doubleClick);       // Attach double click event
+  button.attachLongPressStart(longPressStart); // Attach double click event
+  button.attachLongPressStop(longPressStop);   // Attach double click event
+  delay(500);
+  display.clearDisplay(); // Clear the display
+  delay(1000);
+  printDisplayLine(1, "Initializing PCA9685"); // Print message
+  display.display();                           // Display the text
+  initPCA9685();                               // Initialize PCA9685
+  delay(500);
+  display.clearDisplay();                   // Clear the display
+  printDisplayLine(0, "Initializing Hand"); // Print message
+  display.display();                        // Display the text
+  initHand();
+  delay(500);
+  display.clearDisplay(); // Clear the display
+  // initHallSensor(); // Initialize Hall sensors
+  // delay(1000);
+}
+
+// Display Functions
+void updateValues(int freqMillis)
+{
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastUpdate >= freqMillis)
+  {
+    display.clearDisplay(); // Clear the display
+    getActionPage();
+    display.display(); // Display the data
+    lastUpdate = currentMillis;
+  }
+}
+
+void loop()
+{
+  button.tick(); // Update button state
+  unlockReading();
+  updateValues(30);
+}
